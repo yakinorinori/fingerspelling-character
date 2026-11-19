@@ -1,0 +1,68 @@
+# fingerspelling-character — 指文字の単体文字認識
+
+静止状態モデル（SVM）・動作状態モデル（Transformer）・統一モデル（SVMの確率を入力にした Transformer）を、
+同じ骨格データ・同じ分割で学習して比べる。
+
+## フォルダの置き場所
+
+```
+python_画像処理/
+├── Fingerspelling/Video/transformer訓練/
+│   ├── 静止指文字/かな/動画
+│   ├── 動作指文字/かな/動画
+│   └── 促音/動画
+└── Fingerspelling-repos/
+    └── fingerspelling-character/   ← このリポジトリ
+```
+
+## 使い方
+
+```bash
+cd Fingerspelling-repos/fingerspelling-character
+
+python extract_landmarks.py                    # 1. 骨格保存（画像座標＋world landmarks。最初の1回だけ時間がかかる）
+python train_static_svm.py                     # 2. 静止SVM（分割を決め、統一モデル用の確率も作る）
+python check_depth.py                          # 3. 促音（z方向）が信頼できるかの確認
+python train_sequence.py --task dynamic --final            # 4. 動作モデル（確認がよければ --sokuon を付ける）
+python train_sequence.py --task unified --final            # 5. 統一モデル（同上）
+python recognize_video.py --model "results/models/unified_transformer_S+O+M.pt" 動画.mp4   # 6. 動画で確認
+```
+
+- 人ごとに分けて評価したいとき：`train_static_svm.py --group-regex "^(ASL_[A-E]|ubmoji)"`（分割は以降のモデルにも引き継がれる）
+- Mac の GPU でエラーが出たら `--device cpu`
+- 結果は `results/`（*_summary.csv、混同行列の画像、モデル、ラベル付き動画）
+
+## モデルと特徴量（決めた構成）
+
+| モデル | 本命 | 比較 | 対象 |
+|---|---|---|---|
+| 静止SVM | H3+O | H1（既存） | 静止指文字。動画の手が見えている範囲の中央の半分のフレームを使う |
+| 動作Transformer | H3+O+M | H1+M | 動作指文字すべて（の・も・り・ん 以外も）。`--sokuon` で促音を1クラスとして追加 |
+| 統一Transformer | S+O+M | S+H3+O+M | 静止＋動作（＋促音）を1つのモデルで認識 |
+
+| 記号 | 中身 | 次元 |
+|---|---|---|
+| H1 | 既存のSVMの特徴量（deta.py と同じ計算。不具合も含めてそのまま。過去との比較用） | 30 |
+| H3 | 指の長さで補正した world 骨格から：関節の曲がり15、指先どうしの距離（手の長さで割る）10、指の開き4、補正したかどうか5 | 34 |
+| O | 手のひらの法線3、手首→中指の付け根の方向3 | 6 |
+| M | 手のひら中心の動き（前後7フレームの窓）：8方向ヒストグラム、水平・垂直の比、向きの一貫性、まっすぐ度、主方向と直線らしさ、回転、奥行きの変化、移動量 | 18 |
+| S | 静止SVM（H3+O）の41文字の確率。学習用は「その動画を学習していないSVM」で計算（cache/svm_oof_*.npz） | 41 |
+
+### 指の長さの保存と補正（skeleton.py）
+
+- 骨（指ごとに4本、計20本）の長さを保存する。手が最初に見えたフレームから始める
+- 骨が画面とほぼ平行（|dz|/長さ < 0.3）のフレームだけで、最大値で更新する（1.3倍を超える更新は検出ミスとして無視）
+- 骨が強くカメラを向いている（|dz|/長さ > 0.7）フレームでは、保存した長さで z を作り直す：z = 符号 × √(L² − x² − y²)
+- 手が30フレーム（約1秒）続けて消えたらリセット
+- world landmarks はメートル単位なので、後ろに下がっても長さは変わらない
+
+### 動き M の単位
+
+画面と平行な骨で「画像上の長さ ÷ world の長さ」から 1メートルあたりの画素数を求め、移動量をそれで割る。
+後ろに下がっても、指がカメラを向いても、移動量は実際に動いた距離に近い値になる。奥行きの変化（depth_change）もこの値の変化から取る。
+
+## 分割と評価
+
+- `train_static_svm.py` が全動画に fold 番号を振り（`cache/folds.csv`）、全モデルが同じ分割を使う
+- 系列モデルは fold k をテスト、fold k+1 を最良エポック選び、残りを学習に使う
+- 統一モデルは全体の正解率に加え、静止・動作・促音それぞれの正解率も出す
