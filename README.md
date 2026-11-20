@@ -20,9 +20,9 @@ python_画像処理/
 ```bash
 cd Fingerspelling-repos/fingerspelling-character
 
-python extract_landmarks.py                    # 1. 骨格保存（画像座標＋world landmarks。最初の1回だけ時間がかかる）
+python extract_landmarks.py                    # 1. 骨格保存（右手だけ。画像座標＋world landmarks。最初の1回だけ時間がかかる）
 python train_static_svm.py                     # 2. 静止SVM（分割を決め、統一モデル用の確率も作る）
-python check_depth.py                          # 3. 促音（z方向）が信頼できるかの確認
+python check_depth.py                          # 3. 促音（z方向）が信頼できるかの確認（今は促音を使わないので省略可）
 python train_sequence.py --task dynamic --final            # 4. 動作モデル（確認がよければ --sokuon を付ける）
 python train_sequence.py --task unified --final            # 5. 統一モデル（同上）
 python recognize_video.py --model "results/models/unified_transformer_S+O+M.pt" 動画.mp4   # 6. 動画で確認
@@ -36,17 +36,28 @@ python recognize_video.py --model "results/models/unified_transformer_S+O+M.pt" 
 
 | モデル | 本命 | 比較 | 対象 |
 |---|---|---|---|
-| 静止SVM | H3+O | H1（既存） | 静止指文字。動画の手が見えている範囲の中央の半分のフレームを使う |
+| 静止SVM | H3+O | H1（既存） | 静止指文字。動画の手が見えている範囲の中央の半分のフレームをすべて使う |
 | 動作Transformer | H3+O+M | H1+M | 動作指文字すべて（の・も・り・ん 以外も）。`--sokuon` で促音を1クラスとして追加 |
 | 統一Transformer | S+O+M | S+H3+O+M | 静止＋動作（＋促音）を1つのモデルで認識 |
 
 | 記号 | 中身 | 次元 |
 |---|---|---|
 | H1 | 既存のSVMの特徴量（deta.py と同じ計算。不具合も含めてそのまま。過去との比較用） | 30 |
-| H3 | 指の長さで補正した world 骨格から：関節の曲がり15、指先どうしの距離（手の長さで割る）10、指の開き4、補正したかどうか5 | 34 |
+| H3 | 指の長さで補正した world 骨格から：関節の曲がり15、第二関節から先の曲がり5、指の伸び具合（付け根→指先の距離 ÷ その指の長さ）5、指先どうしの距離（÷ 手のひらの長さ）10、指の開き（付け根4・第二関節4）、補正したかどうか5 | 48 |
 | O | 手のひらの法線3、手首→中指の付け根の方向3 | 6 |
 | M | 手のひら中心の動き（前後7フレームの窓）：8方向ヒストグラム、水平・垂直の比、向きの一貫性、まっすぐ度、主方向と直線らしさ、回転、奥行きの変化、移動量 | 18 |
 | S | 静止SVM（H3+O）の41文字の確率。学習用は「その動画を学習していないSVM」で計算（cache/svm_oof_*.npz） | 41 |
+
+### 右手の選び方（extract_landmarks.py）
+
+- 手を最大2つ検出し、表現者の右手だけを保存する（右手が無いフレームは手なし扱い）
+- 体（Pose）の手首が見えていれば、体の右手首に近い手を右手とする（親指の位置がはっきり左手を示す手は除く）
+- 体が見えなければ、親指の位置で判定する：手のひらの面の法線（手首→中指の付け根 × 小指の付け根→人差し指の付け根）と
+  手首→親指の付け根 の内積の符号。親指の付け根は手のひら側に出ているので、右手と左手で符号が逆になる
+- 親指が手のひらの面に近くて判定しにくいフレームは、手が1つだけで動画全体として右手なら右手とする
+- MediaPipe Hands の Left/Right の判定は使わない（API や撮り方で向きの決まりが変わるため）
+- 元の動画は左右反転していない前提。反転して撮った動画は `--flip` を付ける
+- 以前の形式で保存した骨格は、次に実行したとき自動で作り直す
 
 ### 指の長さの保存と補正（skeleton.py）
 
