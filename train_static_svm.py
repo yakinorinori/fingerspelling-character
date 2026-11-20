@@ -1,7 +1,8 @@
 """
 手順2：静止状態モデル（SVM）の学習と評価
 
-  - 静止指文字の動画から「手が見えているフレームの中央の半分」を使う（手を出す途中・下ろす途中を除く）
+  - 静止指文字の動画から「手が見えているフレームの中央の半分」をすべて使う（手を出す途中・下ろす途中を除く）
+    データが多くて時間がかかりすぎるときは --frames-per-video 20 などで1本あたりの枚数を減らす
   - 特徴量は H3+O（本命）と H1（既存・基準）を比較する
   - 全動画（静止・動作・促音）に fold 番号を振って cache/folds.csv に保存する。以降のモデルも同じ分割を使う
   - 統一モデル用に、各動画の全フレームの SVM の確率を「その動画を学習していない SVM」で計算して保存する
@@ -50,7 +51,7 @@ def pick(idx, k):
 
 
 def make_svm(C):
-    return make_pipeline(StandardScaler(), SVC(C=C, gamma="scale", probability=True,
+    return make_pipeline(StandardScaler(), SVC(C=C, gamma="scale", probability=True, cache_size=2000,
                                                class_weight="balanced", random_state=0))
 
 
@@ -76,7 +77,8 @@ def main():
     parser.add_argument("--features", nargs="+", default=["H3+O", "H1"], help="最初のものが本命（統一モデルに使う）")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--group-regex", default="", help="ファイル名から人などを取り出す正規表現。省略時は動画ごと")
-    parser.add_argument("--frames-per-video", type=int, default=5, help="1本の動画から学習に使うフレーム数（0で全部）")
+    parser.add_argument("--frames-per-video", type=int, default=0,
+                        help="1本の動画から学習に使うフレーム数。0（既定）で中央の半分のフレームをすべて使う")
     parser.add_argument("--C", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--refresh", action="store_true", help="特徴量を計算し直す")
@@ -101,6 +103,8 @@ def main():
             tr = static[fold[static] != k]
             te = static[fold[static] == k]
             X, y = training_frames(tr, feats, valids, labels, args.frames_per_video)
+            if k == 0:
+                print(f"SVM {fs:8s} 学習フレーム数 {len(X)}（1 fold あたり）")
             svm = make_svm(args.C).fit(X, y)
             for i in te:                       # 動画単位：中央の半分のフレームの確率の平均
                 c = center_frames(valids[i])
