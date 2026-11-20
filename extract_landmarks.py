@@ -8,18 +8,28 @@
 出力:  cache/landmarks/<静止指文字|動作指文字|促音>/.../動画名.npz
          lm    (T,21,3) 画像の正規化座標（x/幅, y/高さ, z）。右手が無いフレームは NaN
          world (T,21,3) world landmarks（手の中心が原点、メートル単位）。カメラからの距離に左右されない
-         how   (T,)     右手の決め方（0:右手なし 1:体の手首から 2:Hands の左右判定から）
+         how   (T,)     右手の決め方（0:右手なし 1:体の手首 2:親指の位置 3:動画全体の親指の位置）
+         right (T,)     親指の位置から求めた「右手らしさ」（+ で右手、- で左手。右手が無いフレームは NaN）
 
-右手だけを保存する。体（Pose）が映っていれば体の右手首に近い手を右手とし、
-映っていなければ MediaPipe Hands の左右判定を使う（元の動画は左右反転していない前提）。
-以前の形式（右手を区別していない）で保存したものは、自動で作り直す。
+右手だけを保存する。右手は次の順で決める（元の動画は左右反転していない前提。反転した動画は --flip）
+  1. 体（Pose）の手首が見えている：体の右手首に近い手。ただし親指の位置がはっきり左手を示す手は除く
+  2. 体が見えない：親指の位置から右手と判定できる手（右手らしさ ≥ THUMB_MARGIN）
+  3. 親指の位置が判定しにくいフレーム（指を平らに伸ばして親指が手のひらの面に近いときなど）：
+     手が1つだけで、動画全体で見ると右手なら、その手を右手とする
+MediaPipe Hands の Left/Right の判定は使わない（API や撮り方で向きの決まりが変わり、取り違えが起きるため）。
+
+親指の位置による判定（thumb_side）:
+  手首→中指の付け根 を u、小指の付け根→人差し指の付け根 を r とすると、u × r は手のひらの面の法線。
+  親指の付け根（MCP）は手のひらの面から手のひら側に出ているので、法線と 手首→親指の付け根 の内積の符号で
+  左右が決まる（鏡に映すと符号が逆になる）。world landmarks を使うので、手の向きやカメラからの距離に左右されない。
+以前の形式で保存したものは、自動で作り直す。
        cache/index.csv（動画の一覧とラベル）
 
 使い方:
     python extract_landmarks.py
     python extract_landmarks.py --train-dir "/Users/.../transformer訓練"
     python extract_landmarks.py --redo
-    python extract_landmarks.py --no-pose      # 体を使わない（速いが、左右判定を誤ることがある）
+    python extract_landmarks.py --no-pose      # 体を使わない（速い。親指の位置だけで判定する）
 """
 import argparse
 import csv
@@ -31,42 +41,70 @@ from common import (CACHE_DIR, DEFAULT_TRAIN_DIR, GROUP_DIRS, INDEX_CSV, LANDMAR
                     VIDEO_EXTS, norm, resolve_dir)
 
 
-POSE_VISIBILITY = 0.5            # 体の手首がこれ以上の確からしさで見えていれば、体から右手を決める
-HAND_NONE, HAND_BY_POSE, HAND_BY_LABEL = 0, 1, 2
+POSE_VISIBILITY = 0.5   # 体の手首がこれ以上の確からしさで見えていれば、体から右手を決める
+THUMB_MARGIN = 0.15     # 親指の位置による右手らしさが、この値より大きければ右手・-この値より小さければ左手とみなす
+HAND_NONE, HAND_BY_POSE, HAND_BY_THUMB, HAND_BY_VIDEO = 0, 1, 2, 3
 
 
-def pick_right_hand(res, pose_res, flip):
+def thumb_side(world):
     """
-    検出した手（最大2つ）から、表現者の右手を選ぶ。戻り値: (手の番号 or None, 決め方)
-
-    1. 体（Pose）の手首が見えているとき：体の右手首に最も近く、かつ左手首より右手首に近い手
-    2. 体が見えないとき：MediaPipe Hands の左右の判定
-         Hands は「鏡のように左右反転した画像」を前提に左右を返すので、普通に撮った動画では
-         "Left" が表現者の右手。--flip で反転して入力したときは "Right" が右手
-    ※ 元の動画が普通のカメラで撮ったもの（左右反転していない）とする
+    親指の位置から求めた右手らしさ（-1〜+1。+ で右手）。world (21,3)
+    普通に撮った画像で右手は負、左手は正になる向きなので、符号を反転して返す
     """
-    hands = res.multi_hand_landmarks or []
-    if not hands:
-        return None, HAND_NONE
+    w = np.asarray(world, dtype=np.float64)
+    n = np.cross(w[9] - w[0], w[5] - w[17])
+    t = w[2] - w[0]
+    return float(-np.dot(n, t) / (np.linalg.norm(n) * np.linalg.norm(t) + 1e-9))
+
+
+def pose_right_hand(hand_lms, pose_res, flip):
+    """体の右手首に最も近く、左手首より右手首に近い手の番号（体が見えなければ None, False）"""
     pose = pose_res.pose_landmarks.landmark if (pose_res and pose_res.pose_landmarks) else None
-    if pose is not None:
-        # 反転した画像では、Pose の「右」は実際の左手になる
-        r_id, l_id = (15, 16) if flip else (16, 15)
-        rw, lw = pose[r_id], pose[l_id]
-        if rw.visibility >= POSE_VISIBILITY:
-            best, best_d = None, np.inf
-            for k, h in enumerate(hands):
-                w = h.landmark[0]
-                d_r = (w.x - rw.x) ** 2 + (w.y - rw.y) ** 2
-                d_l = (w.x - lw.x) ** 2 + (w.y - lw.y) ** 2 if lw.visibility >= POSE_VISIBILITY else np.inf
-                if d_r < d_l and d_r < best_d:
-                    best, best_d = k, d_r
-            return best, (HAND_BY_POSE if best is not None else HAND_NONE)
-    right_label = "Right" if flip else "Left"
-    for k, hd in enumerate(res.multi_handedness or []):
-        if hd.classification[0].label == right_label:
-            return k, HAND_BY_LABEL
-    return None, HAND_NONE
+    if pose is None:
+        return None, False
+    r_id, l_id = (15, 16) if flip else (16, 15)     # 反転した画像では Pose の「右」は実際の左手
+    rw, lw = pose[r_id], pose[l_id]
+    if rw.visibility < POSE_VISIBILITY:
+        return None, False
+    best, best_d = None, np.inf
+    for k, h in enumerate(hand_lms):
+        w = h.landmark[0]
+        d_r = (w.x - rw.x) ** 2 + (w.y - rw.y) ** 2
+        d_l = (w.x - lw.x) ** 2 + (w.y - lw.y) ** 2 if lw.visibility >= POSE_VISIBILITY else np.inf
+        if d_r < d_l and d_r < best_d:
+            best, best_d = k, d_r
+    return best, True
+
+
+def choose_right_hands(frames, margin=THUMB_MARGIN):
+    """
+    frames: フレームごとの dict（hands: [(lm, world, 右手らしさ)], pose_k: 体から選んだ番号, pose_ok: 体が見えたか）
+    戻り値: フレームごとの (選んだ手の番号 or None, 決め方)
+    """
+    singles = [f["hands"][0][2] for f in frames if len(f["hands"]) == 1 and np.isfinite(f["hands"][0][2])]
+    video_right = len(singles) > 0 and np.median(singles) >= margin
+    out = []
+    for f in frames:
+        hs = f["hands"]
+        if not hs:
+            out.append((None, HAND_NONE))
+            continue
+        if f["pose_ok"]:
+            k = f["pose_k"]
+            if k is not None and not (hs[k][2] <= -margin):          # 親指がはっきり左手を示すなら採らない
+                out.append((k, HAND_BY_POSE))
+            else:
+                out.append((None, HAND_NONE))
+            continue
+        scores = [h[2] for h in hs]
+        k = int(np.nanargmax(scores)) if np.isfinite(scores).any() else None
+        if k is not None and scores[k] >= margin:
+            out.append((k, HAND_BY_THUMB))
+        elif len(hs) == 1 and video_right and not (scores[0] <= -margin):
+            out.append((0, HAND_BY_VIDEO))
+        else:
+            out.append((None, HAND_NONE))
+    return out
 
 
 def extract_video(video_path, flip=False, use_pose=True):
@@ -74,12 +112,12 @@ def extract_video(video_path, flip=False, use_pose=True):
     動画 → lm (T,21,3), world (T,21,3), 幅, 高さ, fps
     表現者の右手だけを保存する（右手が見つからないフレームは NaN）
     """
-    lm, world, width, height, fps, _ = extract_video_detail(video_path, flip, use_pose)
+    lm, world, width, height, fps, _, _ = extract_video_detail(video_path, flip, use_pose)
     return lm, world, width, height, fps
 
 
 def extract_video_detail(video_path, flip=False, use_pose=True):
-    """extract_video と同じ。加えて各フレームの右手の決め方 how (T,)（0:なし 1:体から 2:左右判定から）を返す"""
+    """extract_video と同じ。加えて右手の決め方 how (T,) と右手らしさ right (T,) を返す"""
     import mediapipe as mp
     if not hasattr(mp, "solutions"):
         raise SystemExit("この mediapipe には mp.solutions がありません。既存のコードと同じバージョンの環境で実行してください")
@@ -87,8 +125,8 @@ def extract_video_detail(video_path, flip=False, use_pose=True):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    lms, worlds, hows = [], [], []
-    nan = np.full((21, 3), np.nan)
+    sign = -1.0 if flip else 1.0          # 反転した画像では親指の判定の符号が逆になる
+    frames = []
     pose = mp.solutions.pose.Pose(static_image_mode=False, model_complexity=1,
                                   min_detection_confidence=0.5, min_tracking_confidence=0.5) if use_pose else None
     with mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2,
@@ -101,25 +139,37 @@ def extract_video_detail(video_path, flip=False, use_pose=True):
                 frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = hands.process(rgb)
-            pose_res = pose.process(rgb) if (pose and res.multi_hand_landmarks) else None
-            k, how = pick_right_hand(res, pose_res, flip)
-            if k is not None:
-                lms.append([[p.x, p.y, p.z] for p in res.multi_hand_landmarks[k].landmark])
-                w = res.multi_hand_world_landmarks
-                worlds.append([[p.x, p.y, p.z] for p in w[k].landmark] if w and len(w) > k else nan)
-            else:
-                lms.append(nan)
-                worlds.append(nan)
-            hows.append(how)
+            hand_lms = res.multi_hand_landmarks or []
+            worlds = res.multi_hand_world_landmarks or []
+            hs = []
+            for k, h in enumerate(hand_lms):
+                lm = [[p.x, p.y, p.z] for p in h.landmark]
+                w = [[p.x, p.y, p.z] for p in worlds[k].landmark] if k < len(worlds) else None
+                hs.append((lm, w, sign * thumb_side(w) if w is not None else np.nan))
+            pose_k, pose_ok = (pose_right_hand(hand_lms, pose.process(rgb), flip)
+                               if (pose and hand_lms) else (None, False))
+            frames.append({"hands": hs, "pose_k": pose_k, "pose_ok": pose_ok})
     if pose:
         pose.close()
     cap.release()
-    lm = np.asarray(lms, dtype=np.float32).reshape(-1, 21, 3)
-    world = np.asarray(worlds, dtype=np.float32).reshape(-1, 21, 3)
-    return lm, world, width, height, float(fps), np.asarray(hows, dtype=np.int8)
+
+    T = len(frames)
+    lm = np.full((T, 21, 3), np.nan, dtype=np.float32)
+    world = np.full((T, 21, 3), np.nan, dtype=np.float32)
+    how = np.zeros(T, dtype=np.int8)
+    right = np.full(T, np.nan, dtype=np.float32)
+    for t, (f, (k, h)) in enumerate(zip(frames, choose_right_hands(frames))):
+        how[t] = h
+        if k is None:
+            continue
+        lm[t] = f["hands"][k][0]
+        if f["hands"][k][1] is not None:
+            world[t] = f["hands"][k][1]
+        right[t] = f["hands"][k][2]
+    return lm, world, width, height, float(fps), how, right
 
 
-LANDMARK_VERSION = "right-hand-1"   # 右手だけを保存する形式。これより前に保存したものは作り直す
+LANDMARK_VERSION = "right-hand-2"   # 右手だけを保存する形式（親指の位置で判定）。これより前に保存したものは作り直す
 
 
 def is_current(path):
@@ -142,7 +192,7 @@ def main():
     parser.add_argument("--train-dir", default=str(DEFAULT_TRAIN_DIR), help="transformer訓練 フォルダ")
     parser.add_argument("--redo", action="store_true", help="保存済みもやり直す")
     parser.add_argument("--flip", action="store_true", help="左右反転してから検出する")
-    parser.add_argument("--no-pose", action="store_true", help="体（Pose）を使わず、Hands の左右判定だけで右手を決める（速い）")
+    parser.add_argument("--no-pose", action="store_true", help="体（Pose）を使わず、親指の位置だけで右手を決める（速い）")
     args = parser.parse_args()
 
     train_dir = resolve_dir(args.train_dir)
@@ -168,13 +218,15 @@ def main():
                 continue
             out = LANDMARK_DIR / dir_name / rel.with_suffix(".npz")
             if args.redo or not is_current(out):
-                lm, world, w, h, fps, how = extract_video_detail(v, args.flip, not args.no_pose)
+                lm, world, w, h, fps, how, right = extract_video_detail(v, args.flip, not args.no_pose)
                 out.parent.mkdir(parents=True, exist_ok=True)
-                np.savez_compressed(out, lm=lm, world=world, width=w, height=h, fps=fps, how=how,
+                np.savez_compressed(out, lm=lm, world=world, width=w, height=h, fps=fps, how=how, right=right,
                                     version=LANDMARK_VERSION)
                 n = max(len(how), 1)
-                print(f"  {label}  {rel.name}: {len(lm)} フレーム, 右手の検出率 {(how > 0).mean() if len(how) else 0:.0%}"
-                      f"（体から {(how == HAND_BY_POSE).sum() / n:.0%}, 左右判定から {(how == HAND_BY_LABEL).sum() / n:.0%}）")
+                r = np.nanmedian(right) if np.isfinite(right).any() else np.nan
+                print(f"  {label}  {rel.name}: {len(lm)} フレーム, 右手の検出率 {(how > 0).sum() / n:.0%}"
+                      f"（体 {(how == HAND_BY_POSE).sum() / n:.0%}, 親指 {(how == HAND_BY_THUMB).sum() / n:.0%}, "
+                      f"動画全体 {(how == HAND_BY_VIDEO).sum() / n:.0%}）, 右手らしさ {r:+.2f}")
             rows.append({"npz": str(out.relative_to(CACHE_DIR)), "video": f"{dir_name}/{rel}",
                          "kind": kind, "label": label})
 

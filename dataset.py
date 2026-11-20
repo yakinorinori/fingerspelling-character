@@ -6,7 +6,7 @@ import numpy as np
 from common import CACHE_DIR, assign_folds, load_index
 from features import compute_blocks
 
-FEATURE_VERSION = "2"            # 特徴量の計算を変えたら上げる（保存済みの計算結果を作り直す）
+FEATURE_VERSION = "3"            # 特徴量の計算を変えたら上げる（保存済みの計算結果を作り直す）
 BLOCK_DIR = CACHE_DIR / "blocks"
 FOLDS_CSV = CACHE_DIR / "folds.csv"
 ALL_BLOCKS = ("H1", "H3", "O", "M")

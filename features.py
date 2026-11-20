@@ -3,8 +3,9 @@
 
 ブロック（1フレームごと）:
   H1  手型・既存   30  deta.py の hand_data と同じ計算（不具合も含めてそのまま。過去の結果との比較用）
-  H3  手型・新規   43  指の長さで補正した world 骨格から：関節の曲がり15、第二関節から先の曲がり5、
-                       指先どうしの距離10、指の開き（付け根4・第二関節4）、補正フラグ5
+  H3  手型・新規   48  指の長さで補正した world 骨格から：関節の曲がり15、第二関節から先の曲がり5、
+                       指の伸び具合5（付け根→指先の距離 ÷ その指の長さ）、指先どうしの距離10（÷ 手のひらの長さ）、
+                       指の開き（付け根4・第二関節4）、補正フラグ5
   O   向き          6  手のひらの法線3、手首→中指の付け根の方向3（補正後の world 骨格）
   M   動き         18  手のひら中心の動きを前後7フレームの窓でまとめたもの（移動量は「実際の距離」に換算）
   S   SVMの確率    41  静止SVMの出力（train_static_svm.py が作る。ここでは計算しない）
@@ -17,7 +18,7 @@ import numpy as np
 
 from skeleton import BONES, FINGERS, correct_sequence
 
-BLOCK_DIMS = {"H1": 30, "H3": 43, "O": 6, "M": 18}
+BLOCK_DIMS = {"H1": 30, "H3": 48, "O": 6, "M": 18}
 PALM_IDS = [0, 5, 9, 13, 17]
 EPS = 1e-9
 
@@ -78,17 +79,19 @@ def _angle(u, v):
 
 def h3_features(corr, flags, lengths):
     """
-    1フレーム43次元:
+    1フレーム48次元（長さはすべて比にしているので、手の大きさ・カメラからの距離に左右されない）:
       bend      15  各関節の曲がり（隣り合う骨のなす角。付け根・第二関節・第一関節 × 5指）
       pip_curl   5  第二関節から先の曲がり：「付け根→第二関節」と「第二関節→指先」のなす角
                     （第一関節・指先の小さな曲がりも足し合わさるので、少し曲がった指が区別しやすい）
-      dist      10  指先どうしの距離（手の長さで割る）
+      extend     5  指の伸び具合：付け根→指先の直線距離 ÷ その指の3本の骨の長さの和（保存した長さ）
+                    まっすぐで 1、曲げるほど小さくなる。指ごとの長さで割るので、人による指の長さの違いが消える
+      dist      10  指先どうしの距離 ÷ 手のひらの長さ（手首→中指の付け根。保存した長さ）
       spread     4  隣の指との開き（付け根→第二関節の向きどうし）
       spread_pip 4  隣の指との開き（第二関節→指先の向きどうし。指先側がそろっているか・離れているか）
       flags      5  その指を補正したか
     親指は「付け根」= CMC(1), 「第二関節」= MCP(2) として同じ計算をする
     """
-    out = np.zeros((len(corr), 43), dtype=np.float32)
+    out = np.zeros((len(corr), 48), dtype=np.float32)
     for t in range(len(corr)):
         p = corr[t]
         if np.isnan(p).any():
@@ -97,11 +100,17 @@ def h3_features(corr, flags, lengths):
         bend = [_angle(vec[f][i], vec[f][i + 1]) for f in range(5) for i in range(3)]      # 15
         distal = [p[f[4]] - p[f[2]] for f in FINGERS]                                     # 第二関節→指先
         pip_curl = [_angle(vec[f][1], distal[f]) for f in range(5)]                       # 5
+        extend = []                                                                       # 5
+        for f in range(5):
+            bl = lengths[t, 4 * f + 1:4 * f + 4]                                          # 付け根から先の3本
+            if not np.isfinite(bl).all():
+                bl = [np.linalg.norm(v) for v in vec[f][1:]]
+            extend.append(np.linalg.norm(p[FINGERS[f][4]] - p[FINGERS[f][1]]) / (float(np.sum(bl)) + EPS))
         hand_len = lengths[t, 8] if np.isfinite(lengths[t, 8]) else np.linalg.norm(p[9] - p[0])  # 手首→中指の付け根
         dist = [np.linalg.norm(p[a] - p[b]) / (hand_len + EPS) for a, b in TIP_PAIRS]      # 10
         spread = [_angle(vec[f][1], vec[f + 1][1]) for f in range(4)]                     # 4
         spread_pip = [_angle(distal[f], distal[f + 1]) for f in range(4)]                 # 4
-        out[t] = bend + pip_curl + dist + spread + spread_pip + list(flags[t])            # +5
+        out[t] = bend + pip_curl + extend + dist + spread + spread_pip + list(flags[t])   # +5
     return out
 
 
