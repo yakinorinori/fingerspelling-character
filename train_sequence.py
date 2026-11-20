@@ -20,6 +20,9 @@ fold k をテスト、fold k+1 を最良エポックを選ぶ検証用、残り�
     python train_sequence.py --task dynamic --sokuon       # 促音も入れる（check_depth.py で確認してから）
 """
 import argparse
+import os
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # Mac(MPS)で未対応の処理は CPU で計算
 import csv
 import time
 
