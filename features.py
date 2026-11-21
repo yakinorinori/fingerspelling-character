@@ -249,3 +249,20 @@ def build(feature_set, blocks, extra=None):
             raise KeyError(f"特徴量ブロック {b} がありません")
         parts.append(src[b])
     return np.concatenate(parts, axis=1).astype(np.float32)
+
+
+def fit_length(seq, valid, max_len):
+    """
+    系列の長さをそろえる（Transformer のメモリ対策。注意の計算量は長さの2乗で増える）
+      1. 最初に手が見えたフレームから最後に手が見えたフレームまでに切り詰める
+      2. それでも max_len を超えるときは、等間隔に max_len フレームを選ぶ（動きの全体は残る）
+    戻り値: (seq, valid)
+    """
+    idx = np.flatnonzero(valid)
+    if len(idx):
+        seq, valid = seq[idx[0]:idx[-1] + 1], valid[idx[0]:idx[-1] + 1]
+    if max_len and len(seq) > max_len:
+        pick = np.linspace(0, len(seq) - 1, max_len).round().astype(int)
+        seq, valid = seq[pick], valid[pick]
+    return seq, valid
+

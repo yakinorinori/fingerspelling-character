@@ -33,7 +33,7 @@ from torch import nn
 
 from common import CACHE_DIR, MODEL_DIR, RESULT_DIR, SOKUON_LABEL
 from dataset import load_all, read_folds
-from features import build, parse_set
+from features import build, fit_length, parse_set
 from models import MODELS, build_model, count_params
 from plotting import plot_confusion
 
@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--svm-features", default="H3+O", help="S に使う SVM（train_static_svm.py の本命）")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--max-len", type=int, default=128,
+                        help="1本の系列の最大フレーム数。手が見えている範囲に切り詰め、超える分は等間隔に間引く（0で制限なし）")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -141,10 +143,19 @@ def main():
         oof, svm_classes = load_oof(rows, args.svm_features)
         extra = [{"S": p} for p in oof]
 
+    lengths = np.array([len(v) for v in valids])
+    long_ids = np.argsort(lengths)[::-1][:5]
+    print(f"系列の長さ: 中央値 {int(np.median(lengths))}, 最大 {lengths.max()} フレーム"
+          f"（{args.max_len} を超える {int((lengths > args.max_len).sum()) if args.max_len else 0} 本は間引く）")
+    print("  長い動画: " + ", ".join(f"{rows[i]['video']}（{lengths[i]}）" for i in long_ids))
+
     RESULT_DIR.mkdir(exist_ok=True)
     summary = []
     for fs in feature_sets:
-        raw = [build(fs, b, extra[i] if extra else None) for i, b in enumerate(blocks)]
+        fitted = [fit_length(build(fs, b, extra[i] if extra else None), valids[i], args.max_len)
+                  for i, b in enumerate(blocks)]
+        raw = [f[0] for f in fitted]
+        seq_valids = [f[1] for f in fitted]
         for model_name in args.models:
             name = f"{args.task}_{model_name}_{fs}"
             t0 = time.time()
@@ -153,7 +164,7 @@ def main():
                 te = np.flatnonzero(fold == k)
                 va = np.flatnonzero(fold == (k + 1) % n_folds)
                 tr = np.flatnonzero((fold != k) & (fold != (k + 1) % n_folds))
-                model, _, seqs, ep = train_one(model_name, raw, valids, labels, len(classes), tr, va, args, device)
+                model, _, seqs, ep = train_one(model_name, raw, seq_valids, labels, len(classes), tr, va, args, device)
                 p = predict(model, seqs, te, args.batch, device).argmax(1)
                 true += list(labels[te])
                 pred += list(p)
@@ -176,11 +187,12 @@ def main():
             if args.final:
                 va = np.flatnonzero(fold == 0)
                 tr = np.flatnonzero(fold != 0)
-                model, scaler, _, ep = train_one(model_name, raw, valids, labels, len(classes), tr, va, args, device)
+                model, scaler, _, ep = train_one(model_name, raw, seq_valids, labels, len(classes), tr, va, args, device)
                 MODEL_DIR.mkdir(parents=True, exist_ok=True)
                 torch.save({"task": args.task, "model": model_name, "features": fs, "classes": classes,
                             "in_dim": int(raw[0].shape[1]), "state_dict": model.state_dict(),
                             "mean": scaler.mean, "std": scaler.std, "svm_features": args.svm_features,
+                            "max_len": args.max_len,
                             "cv_accuracy": s["accuracy"]}, MODEL_DIR / f"{name}.pt")
                 print(f"モデルを保存: results/models/{name}.pt")
 

@@ -23,7 +23,7 @@ import torch
 
 from common import MODEL_DIR, RESULT_DIR, VIDEO_EXTS
 from extract_landmarks import extract_video
-from features import build, compute_blocks, parse_set
+from features import build, compute_blocks, fit_length, parse_set
 from models import build_model
 from train_static_svm import center_frames
 
@@ -122,7 +122,7 @@ def process(video, pack, args, drawer):
         classes = pack["classes"]
         extra = {"S": svm_probs(pack["svm"], blocks, valid)} if "svm" in pack else None
         seq = build(pack["features"], blocks, extra)
-        whole = run_seq(pack, seq)
+        whole = run_seq(pack, fit_length(seq, valid, pack.get("max_len", 0))[0])   # 学習と同じ長さのそろえ方
         if args.window and T >= args.window:
             starts = np.arange(0, T - args.window + 1, args.stride)
             wins = [run_seq(pack, seq[s:s + args.window]) for s in starts]
